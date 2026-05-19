@@ -1,20 +1,12 @@
 .{
     .name = .zdbc,
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0xe968c5df45f98265,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zqlite = .{
             .url = "git+https://github.com/karlseguin/zqlite.zig#master",
             .hash = "zqlite-0.0.1-RWLaY64xnAAxsD2YNT8QqPMJUuaFv2GOzFRR4aGypJv3",
-        },
-        .pg = .{
-            .url = "git+https://github.com/karlseguin/pg.zig#master",
-            .hash = "pg-0.0.0-Wp_7gViDBgDB4734XO6MhGbrvDwWTwX9lFF8Rr9-R3p7",
-        },
-        .myzql = .{
-            .url = "git+https://github.com/speed2exe/myzql#main",
-            .hash = "myzql-0.0.0-XU5aAGYcAwD5F0BXNRyhhZlE2BOcozErUATya4Q_L9-q",
         },
     },
     .paths = .{

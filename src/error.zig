@@ -42,6 +42,8 @@ pub const Error = error{
     NotImplemented,
     /// Unsupported backend
     UnsupportedBackend,
+    /// Driver not enabled at build time
+    DriverNotEnabled,
     /// Result already consumed
     ResultConsumed,
     /// Database is busy

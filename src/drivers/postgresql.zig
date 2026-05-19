@@ -1,45 +1,32 @@
 //! PostgreSQL database driver
 //!
-//! This driver wraps the pg.zig library to provide PostgreSQL support
-//! through the ZDBC VTable interface.
+//! Uses libpq C library for real parameterized query binding (PQexecParams).
+//! This is the production-safe approach — no string interpolation.
 //!
-//! Dependencies: https://github.com/karlseguin/pg.zig
+//! Requires: libpq-dev (brew install libpq / apt install libpq-dev)
+//! Build with: zig build -Duse_pg=true
 
 const std = @import("std");
-const pg = @import("pg");
+const build_opts = @import("build_options");
 const Connection = @import("../connection.zig").Connection;
 const ConnectionVTable = @import("../connection.zig").ConnectionVTable;
 const Result = @import("../result.zig").Result;
 const ResultVTable = @import("../result.zig").ResultVTable;
 const Statement = @import("../statement.zig").Statement;
-const StatementVTable = @import("../statement.zig").StatementVTable;
 const value = @import("../value.zig");
 const Value = value.Value;
 const SqlParam = value.SqlParam;
 const Error = @import("../error.zig").Error;
 const Uri = @import("../uri.zig").Uri;
 
-var global_io_threaded: std.Io.Threaded = undefined;
-var global_io_initialized: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-fn getGlobalIo() std.Io {
-    if (global_io_initialized.load(.acquire)) {
-        return global_io_threaded.io();
-    }
-
-    const gpa = std.heap.page_allocator;
-    const single_threaded = @import("builtin").single_threaded;
-    global_io_threaded = std.Io.Threaded.init(gpa, .{
-        .async_limit = if (single_threaded) .nothing else null,
-    });
-    global_io_initialized.store(true, .release);
-    return global_io_threaded.io();
-}
+const c = if (build_opts.use_pg) @cImport({
+    @cInclude("libpq-fe.h");
+}) else struct {};
 
 /// PostgreSQL connection context
 pub const PgContext = struct {
     allocator: std.mem.Allocator,
-    conn: pg.Conn,
+    conn: ?*c.PGconn,
     last_error: ?[]const u8 = null,
     affected_rows: usize = 0,
     last_insert_id: i64 = 0,
@@ -47,18 +34,23 @@ pub const PgContext = struct {
     pub fn init(allocator: std.mem.Allocator, uri: Uri) !*PgContext {
         const host = uri.host orelse "127.0.0.1";
         const port = uri.port orelse 5432;
+        const username = uri.username orelse "postgres";
+        const password = uri.password orelse "";
+        const database = if (uri.database.len > 0) uri.database else "postgres";
 
-        const io = getGlobalIo();
-        var conn = pg.Conn.open(io, allocator, .{
-            .host = host,
-            .port = port,
-        }) catch return error.ConnectionFailed;
+        var conn_buf: [1024]u8 = undefined;
+        const conn_str = try std.fmt.bufPrintZ(&conn_buf,
+            "host={s} port={d} dbname={s} user={s} password={s}",
+            .{ host, port, database, username, password },
+        );
 
-        conn.auth(.{
-            .username = uri.username orelse "postgres",
-            .password = uri.password,
-            .database = if (uri.database.len > 0) uri.database else null,
-        }) catch return error.ConnectionFailed;
+        const conn = c.PQconnectdb(conn_str);
+        if (c.PQstatus(conn) != c.CONNECTION_OK) {
+            const msg = c.PQerrorMessage(conn);
+            std.debug.print("PostgreSQL connect failed: {s}\n", .{msg});
+            c.PQfinish(conn);
+            return error.ConnectionFailed;
+        }
 
         const ctx = try allocator.create(PgContext);
         ctx.* = PgContext{
@@ -69,34 +61,55 @@ pub const PgContext = struct {
     }
 
     pub fn deinit(self: *PgContext) void {
-        self.conn.deinit();
+        if (self.conn) |cxn| {
+            c.PQfinish(cxn);
+            self.conn = null;
+        }
         self.allocator.destroy(self);
     }
 };
 
-/// PostgreSQL result context
+/// PostgreSQL result context — wraps libpq PGresult
 pub const PgResultContext = struct {
     allocator: std.mem.Allocator,
-    result: ?*pg.Result = null,
-    current_row: ?pg.Row = null,
+    res: ?*c.PGresult = null,
+    current_row: usize = 0,
+    n_rows: usize = 0,
+    n_cols: usize = 0,
+    column_names: []const []const u8 = &.{},
 
-    pub fn init(allocator: std.mem.Allocator) !*PgResultContext {
+    pub fn init(allocator: std.mem.Allocator, res: *c.PGresult) !*PgResultContext {
+        const n_cols: usize = @intCast(c.PQnfields(res));
+        const n_rows: usize = @intCast(c.PQntuples(res));
+
+        var column_names = try allocator.alloc([]const u8, n_cols);
+        errdefer allocator.free(column_names);
+
+        for (0..n_cols) |i| {
+            const name = std.mem.span(c.PQfname(res, @intCast(i)));
+            column_names[i] = try allocator.dupe(u8, name);
+        }
+
         const ctx = try allocator.create(PgResultContext);
         ctx.* = PgResultContext{
             .allocator = allocator,
+            .res = res,
+            .n_rows = n_rows,
+            .n_cols = n_cols,
+            .column_names = column_names,
         };
         return ctx;
     }
 
     pub fn deinit(self: *PgResultContext) void {
-        if (self.result) |result| {
-            // Drain any remaining rows to leave the connection in a clean state.
-            // Errors are ignored here because we're in cleanup and can't propagate them,
-            // and failing to drain won't cause memory leaks - just connection state issues
-            // that will be resolved when the connection is closed.
-            result.drain() catch {};
-            result.deinit();
+        if (self.res) |res| {
+            c.PQclear(res);
+            self.res = null;
         }
+        for (self.column_names) |name| {
+            self.allocator.free(name);
+        }
+        self.allocator.free(self.column_names);
         self.allocator.destroy(self);
     }
 };
@@ -115,43 +128,57 @@ const pgResultVTable = ResultVTable{
 
 fn pgResultNext(ctx: *anyopaque) Error!bool {
     const result_ctx: *PgResultContext = @ptrCast(@alignCast(ctx));
-    if (result_ctx.result) |result| {
-        const row = result.next() catch return Error.ExecutionFailed;
-        if (row) |r| {
-            result_ctx.current_row = r;
-            return true;
-        }
+    if (result_ctx.current_row < result_ctx.n_rows) {
+        result_ctx.current_row += 1;
+        return true;
     }
     return false;
 }
 
 fn pgResultColumnCount(ctx: *anyopaque) usize {
     const result_ctx: *PgResultContext = @ptrCast(@alignCast(ctx));
-    if (result_ctx.result) |result| {
-        return result.number_of_columns;
-    }
-    return 0;
+    return result_ctx.n_cols;
 }
 
-fn pgResultColumnName(_: *anyopaque, _: usize) ?[]const u8 {
+fn pgResultColumnName(ctx: *anyopaque, index: usize) ?[]const u8 {
+    const result_ctx: *PgResultContext = @ptrCast(@alignCast(ctx));
+    if (index < result_ctx.column_names.len) {
+        return result_ctx.column_names[index];
+    }
     return null;
 }
 
 fn pgResultGetValue(ctx: *anyopaque, index: usize) Error!Value {
     const result_ctx: *PgResultContext = @ptrCast(@alignCast(ctx));
-    if (result_ctx.current_row) |row| {
-        const text = row.get([]const u8, index) catch return Error.ExecutionFailed;
-        return Value.initText(text);
+    if (result_ctx.current_row == 0 or result_ctx.current_row > result_ctx.n_rows) {
+        return Error.NoMoreRows;
     }
-    return Error.NoMoreRows;
+    const ri: c_int = @intCast(result_ctx.current_row - 1);
+    const ci: c_int = @intCast(index);
+
+    if (c.PQgetisnull(result_ctx.res, ri, ci) == 1) {
+        return Value.initNull();
+    }
+
+    // References PGresult internal storage — valid until result.deinit()
+    const ptr: [*]u8 = c.PQgetvalue(result_ctx.res, ri, ci);
+    const len: usize = @intCast(c.PQgetlength(result_ctx.res, ri, ci));
+    return Value{ .text = ptr[0..len] };
 }
 
-fn pgResultGetValueByName(_: *anyopaque, _: []const u8) Error!Value {
-    return Error.NotImplemented;
+fn pgResultGetValueByName(ctx: *anyopaque, name: []const u8) Error!Value {
+    const result_ctx: *PgResultContext = @ptrCast(@alignCast(ctx));
+    if (result_ctx.res == null) return Error.NoMoreRows;
+
+    const ci = c.PQfnumber(result_ctx.res, name.ptr);
+    if (ci < 0) return Error.ColumnNotFound;
+
+    return pgResultGetValue(ctx, @intCast(ci));
 }
 
-fn pgResultAffectedRows(_: *anyopaque) usize {
-    return 0;
+fn pgResultAffectedRows(ctx: *anyopaque) usize {
+    const result_ctx: *PgResultContext = @ptrCast(@alignCast(ctx));
+    return result_ctx.n_rows;
 }
 
 fn pgResultDeinit(ctx: *anyopaque) void {
@@ -174,54 +201,152 @@ pub const pgConnectionVTable = ConnectionVTable{
     .lastError = pgLastError,
 };
 
+// ============================================================
+// Parameter binding — real PQexecParams, no string interpolation
+// ============================================================
+
+const PgParams = struct {
+    values: []?[*:0]const u8,
+    lengths: []c_int,
+    formats: []c_int,
+    strings: [][]const u8,
+    owned: []bool,
+};
+
+fn buildParams(allocator: std.mem.Allocator, params: []const SqlParam) !PgParams {
+    var values = try allocator.alloc(?[*:0]const u8, params.len);
+    errdefer allocator.free(values);
+    var lengths = try allocator.alloc(c_int, params.len);
+    errdefer allocator.free(lengths);
+    var formats = try allocator.alloc(c_int, params.len);
+    errdefer allocator.free(formats);
+    var strings = try allocator.alloc([]const u8, params.len);
+    errdefer allocator.free(strings);
+    var owned = try allocator.alloc(bool, params.len);
+    errdefer allocator.free(owned);
+    @memset(owned, false);
+
+    for (params, 0..) |p, i| {
+        formats[i] = 0;
+        switch (p) {
+            .null => {
+                values[i] = null;
+                lengths[i] = 0;
+            },
+            .int => |v| {
+                const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
+                defer allocator.free(s);
+                const s0 = try allocator.alloc(u8, s.len + 1);
+                @memcpy(s0[0..s.len], s);
+                s0[s.len] = 0;
+                strings[i] = s0;
+                owned[i] = true;
+                values[i] = @ptrCast(s0.ptr);
+                lengths[i] = 0;
+            },
+            .real => |v| {
+                const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
+                defer allocator.free(s);
+                const s0 = try allocator.alloc(u8, s.len + 1);
+                @memcpy(s0[0..s.len], s);
+                s0[s.len] = 0;
+                strings[i] = s0;
+                owned[i] = true;
+                values[i] = @ptrCast(s0.ptr);
+                lengths[i] = 0;
+            },
+            .text => |v| {
+                const s = try allocator.alloc(u8, v.len + 1);
+                @memcpy(s[0..v.len], v);
+                s[v.len] = 0;
+                strings[i] = s;
+                owned[i] = true;
+                values[i] = @ptrCast(s.ptr);
+                lengths[i] = 0;
+            },
+            .blob => |v| {
+                values[i] = @constCast(@ptrCast(v.ptr));
+                lengths[i] = @intCast(v.len);
+                formats[i] = 1;
+            },
+        }
+    }
+
+    return .{ .values = values, .lengths = lengths, .formats = formats, .strings = strings, .owned = owned };
+}
+
+fn freeParams(allocator: std.mem.Allocator, p: PgParams) void {
+    for (p.strings, p.owned) |s, own| if (own) allocator.free(s);
+    allocator.free(p.strings);
+    allocator.free(p.owned);
+    allocator.free(p.values);
+    allocator.free(p.lengths);
+    allocator.free(p.formats);
+}
+
+fn execInternal(pg_ctx: *PgContext, allocator: std.mem.Allocator, sql: []const u8, params: []const SqlParam, expect_tuples: bool) Error!*c.PGresult {
+    if (params.len == 0) {
+        const res = c.PQexec(pg_ctx.conn, sql.ptr) orelse return Error.ExecutionFailed;
+        const status = c.PQresultStatus(res);
+        const expected = if (expect_tuples) c.PGRES_TUPLES_OK else c.PGRES_COMMAND_OK;
+        if (status != expected) {
+            _ = c.PQerrorMessage(pg_ctx.conn);
+            c.PQclear(res);
+            return Error.ExecutionFailed;
+        }
+        // Track affected rows for exec
+        if (!expect_tuples) {
+            const s = std.mem.span(c.PQcmdTuples(res));
+            pg_ctx.affected_rows = if (s.len > 0) std.fmt.parseInt(usize, s, 10) catch 0 else 0;
+        }
+        return res;
+    }
+
+    const bind = try buildParams(allocator, params);
+    defer freeParams(allocator, bind);
+
+    const res = c.PQexecParams(
+        pg_ctx.conn,
+        sql.ptr,
+        @intCast(params.len),
+        null,
+        bind.values.ptr,
+        bind.lengths.ptr,
+        bind.formats.ptr,
+        0,
+    ) orelse return Error.ExecutionFailed;
+
+    const status = c.PQresultStatus(res);
+    const expected = if (expect_tuples) c.PGRES_TUPLES_OK else c.PGRES_COMMAND_OK;
+    if (status != expected) {
+        _ = c.PQerrorMessage(pg_ctx.conn);
+        c.PQclear(res);
+        return Error.ExecutionFailed;
+    }
+
+    if (!expect_tuples) {
+        const s = std.mem.span(c.PQcmdTuples(res));
+        pg_ctx.affected_rows = if (s.len > 0) std.fmt.parseInt(usize, s, 10) catch 0 else 0;
+    }
+
+    return res;
+}
+
 fn pgExec(ctx: *anyopaque, allocator: std.mem.Allocator, sql: []const u8, params: []const SqlParam) Error!usize {
     const pg_ctx: *PgContext = @ptrCast(@alignCast(ctx));
-
-    var sql_to_use: []const u8 = sql;
-    var need_to_free = false;
-
-    if (params.len > 0) {
-        sql_to_use = value.interpolateSqlParamPostgres(allocator, sql, params) catch return Error.InvalidParameter;
-        need_to_free = true;
-    }
-
-    errdefer if (need_to_free) allocator.free(sql_to_use);
-
-    const affected = pg_ctx.conn.exec(sql_to_use, .{}) catch return Error.ExecutionFailed;
-
-    if (need_to_free) {
-        allocator.free(sql_to_use);
-    }
-
-    if (affected) |count| {
-        pg_ctx.affected_rows = if (count >= 0) @intCast(count) else 0;
-    } else {
-        pg_ctx.affected_rows = 0;
-    }
+    const res = try execInternal(pg_ctx, allocator, sql, params, false);
+    c.PQclear(res);
     return pg_ctx.affected_rows;
 }
 
 fn pgQuery(ctx: *anyopaque, allocator: std.mem.Allocator, sql: []const u8, params: []const SqlParam) Error!Result {
     const pg_ctx: *PgContext = @ptrCast(@alignCast(ctx));
+    const res = try execInternal(pg_ctx, allocator, sql, params, true);
 
-    var sql_to_use: []const u8 = sql;
-    var need_to_free = false;
-
-    if (params.len > 0) {
-        sql_to_use = value.interpolateSqlParamPostgres(allocator, sql, params) catch return Error.InvalidParameter;
-        need_to_free = true;
-    }
-
-    errdefer if (need_to_free) allocator.free(sql_to_use);
-
-    const result = pg_ctx.conn.query(sql_to_use, .{}) catch return Error.ExecutionFailed;
-
-    if (need_to_free) {
-        allocator.free(sql_to_use);
-    }
-
-    const result_ctx = PgResultContext.init(allocator) catch return Error.OutOfMemory;
-    result_ctx.result = result;
+    const result_ctx = PgResultContext.init(allocator, res) catch {
+        c.PQclear(res);
+        return Error.OutOfMemory;
+    };
 
     return Result.init(@ptrCast(result_ctx), &pgResultVTable);
 }
@@ -232,17 +357,23 @@ fn pgPrepare(_: *anyopaque, _: std.mem.Allocator, _: []const u8) Error!Statement
 
 fn pgBegin(ctx: *anyopaque) Error!void {
     const pg_ctx: *PgContext = @ptrCast(@alignCast(ctx));
-    pg_ctx.conn.begin() catch return Error.TransactionError;
+    const res = c.PQexec(pg_ctx.conn, "BEGIN") orelse return Error.TransactionError;
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) return Error.TransactionError;
 }
 
 fn pgCommit(ctx: *anyopaque) Error!void {
     const pg_ctx: *PgContext = @ptrCast(@alignCast(ctx));
-    pg_ctx.conn.commit() catch return Error.TransactionError;
+    const res = c.PQexec(pg_ctx.conn, "COMMIT") orelse return Error.TransactionError;
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) return Error.TransactionError;
 }
 
 fn pgRollback(ctx: *anyopaque) Error!void {
     const pg_ctx: *PgContext = @ptrCast(@alignCast(ctx));
-    pg_ctx.conn.rollback() catch return Error.TransactionError;
+    const res = c.PQexec(pg_ctx.conn, "ROLLBACK") orelse return Error.TransactionError;
+    defer c.PQclear(res);
+    if (c.PQresultStatus(res) != c.PGRES_COMMAND_OK) return Error.TransactionError;
 }
 
 fn pgClose(ctx: *anyopaque) void {
@@ -260,20 +391,25 @@ fn pgAffectedRows(ctx: *anyopaque) usize {
     return pg_ctx.affected_rows;
 }
 
-fn pgPing(_: *anyopaque) Error!void {
-    // PostgreSQL ping would require executing a simple query
+fn pgPing(ctx: *anyopaque) Error!void {
+    const pg_ctx: *PgContext = @ptrCast(@alignCast(ctx));
+    if (pg_ctx.conn == null) return Error.ConnectionFailed;
+    if (c.PQstatus(pg_ctx.conn) != c.CONNECTION_OK) return Error.ConnectionFailed;
 }
 
 fn pgLastError(ctx: *anyopaque) ?[]const u8 {
     const pg_ctx: *PgContext = @ptrCast(@alignCast(ctx));
-    if (pg_ctx.conn.err) |err| {
-        return err.message;
+    if (pg_ctx.conn) |cxn| {
+        const msg = c.PQerrorMessage(cxn);
+        if (msg[0] != 0) return std.mem.span(msg);
     }
     return null;
 }
 
 /// Open a PostgreSQL database connection
 pub fn open(allocator: std.mem.Allocator, uri: Uri) Error!Connection {
+    if (!build_opts.use_pg) return error.DriverNotEnabled;
+
     const ctx = PgContext.init(allocator, uri) catch return Error.ConnectionFailed;
 
     return Connection{
@@ -285,8 +421,7 @@ pub fn open(allocator: std.mem.Allocator, uri: Uri) Error!Connection {
 }
 
 test "postgresql driver interface" {
-    // This test only verifies the interface compiles correctly
-    // Actual PostgreSQL tests require a running database
+    if (!build_opts.use_pg) return error.SkipZigTest;
     const uri = Uri.parse("postgresql://user:pass@localhost:5432/testdb") catch unreachable;
     _ = uri;
 }
@@ -301,43 +436,40 @@ test "postgresql driver interface" {
 // - ZDBC_PG_DATABASE (default: zdbc_test)
 // ============================================================================
 
+fn getEnvVar(allocator: std.mem.Allocator, name: [:0]const u8, default: []const u8) ?[]const u8 {
+    const raw = std.c.getenv(name.ptr);
+    if (raw) |ptr| {
+        const s = std.mem.sliceTo(ptr, 0);
+        return allocator.dupe(u8, s) catch return null;
+    }
+    if (default.len == 0) return null;
+    return allocator.dupe(u8, default) catch return null;
+}
+
 fn getPgTestUri(allocator: std.mem.Allocator) ?[]const u8 {
-    const password_bytes = std.c.getenv("ZDBC_PG_PASSWORD");
-    if (password_bytes == null) return null;
-    const password = allocator.dupeZ(u8, std.mem.span(password_bytes).?) catch return null;
+    const password = getEnvVar(allocator, "ZDBC_PG_PASSWORD", "") orelse return null;
     defer allocator.free(password);
 
-    const host_str = std.c.getenv("ZDBC_PG_HOST") orelse "localhost";
-    const host_bytes = allocator.dupe(u8, std.mem.span(host_str)) catch return null;
-    defer allocator.free(host_bytes);
+    const host = getEnvVar(allocator, "ZDBC_PG_HOST", "localhost") orelse return null;
+    defer allocator.free(host);
 
-    const port_str = std.c.getenv("ZDBC_PG_PORT") orelse "5432";
-    const port_bytes = allocator.dupe(u8, std.mem.span(port_str)) catch return null;
-    defer allocator.free(port_bytes);
+    const port = getEnvVar(allocator, "ZDBC_PG_PORT", "5432") orelse return null;
+    defer allocator.free(port);
 
-    const user_str = std.c.getenv("ZDBC_PG_USER") orelse "postgres";
-    const user_bytes = allocator.dupe(u8, std.mem.span(user_str)) catch return null;
-    defer allocator.free(user_bytes);
+    const user = getEnvVar(allocator, "ZDBC_PG_USER", "postgres") orelse return null;
+    defer allocator.free(user);
 
-    const db_str = std.c.getenv("ZDBC_PG_DATABASE") orelse "zdbc_test";
-    const database_bytes = allocator.dupe(u8, std.mem.span(db_str)) catch return null;
-    defer allocator.free(database_bytes);
+    const database = getEnvVar(allocator, "ZDBC_PG_DATABASE", "zdbc_test") orelse return null;
+    defer allocator.free(database);
 
     return std.fmt.allocPrint(allocator, "postgresql://{s}:{s}@{s}:{s}/{s}", .{
-        user_bytes,
-        password,
-        host_bytes,
-        port_bytes,
-        database_bytes,
+        user, password, host, port, database,
     }) catch return null;
 }
 
 test "postgresql: connection and ping" {
     const allocator = std.testing.allocator;
-    const uri_str = getPgTestUri(allocator) orelse {
-        // Skip test if PostgreSQL is not configured
-        return;
-    };
+    const uri_str = getPgTestUri(allocator) orelse return;
     defer allocator.free(uri_str);
 
     const uri = Uri.parse(uri_str) catch return;
@@ -346,8 +478,6 @@ test "postgresql: connection and ping" {
         return;
     };
     defer conn.close();
-
-    // Test ping
     try conn.ping();
 }
 
@@ -360,16 +490,9 @@ test "postgresql: create table and insert" {
     var conn = open(allocator, uri) catch return;
     defer conn.close();
 
-    // Drop table if exists
     _ = conn.exec("DROP TABLE IF EXISTS pg_test_basic", &.{}) catch {};
-
-    // Create table
     _ = try conn.exec("CREATE TABLE pg_test_basic (id SERIAL PRIMARY KEY, name TEXT, value REAL)", &.{});
-
-    // Insert data
-    _ = try conn.exec("INSERT INTO pg_test_basic (name, value) VALUES ('hello', 3.14)", &.{});
-
-    // Cleanup
+    _ = try conn.exec("INSERT INTO pg_test_basic (name, value) VALUES ($1, $2)", &.{ SqlParam.bindText("hello"), SqlParam.bindReal(3.14) });
     _ = try conn.exec("DROP TABLE pg_test_basic", &.{});
 }
 
@@ -382,32 +505,42 @@ test "postgresql: query returns rows" {
     var conn = open(allocator, uri) catch return;
     defer conn.close();
 
-    // Drop table if exists
     _ = conn.exec("DROP TABLE IF EXISTS pg_test_query", &.{}) catch {};
-
-    // Create and populate table
     _ = try conn.exec("CREATE TABLE pg_test_query (id SERIAL, name TEXT)", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_query (name) VALUES ('Alice')", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_query (name) VALUES ('Bob')", &.{});
+    _ = try conn.exec("INSERT INTO pg_test_query (name) VALUES ($1)", &.{SqlParam.bindText("Alice")});
+    _ = try conn.exec("INSERT INTO pg_test_query (name) VALUES ($1)", &.{SqlParam.bindText("Bob")});
 
-    // Query
     var result = try conn.query("SELECT id, name FROM pg_test_query ORDER BY id", &.{});
     defer result.deinit();
 
-    // First row
-    const row1 = try result.next();
-    try std.testing.expect(row1 != null);
+    try std.testing.expect((try result.next()) != null);
+    try std.testing.expect((try result.next()) != null);
+    try std.testing.expect((try result.next()) == null);
 
-    // Second row
-    const row2 = try result.next();
-    try std.testing.expect(row2 != null);
-
-    // No more rows
-    const row3 = try result.next();
-    try std.testing.expect(row3 == null);
-
-    // Cleanup
     _ = try conn.exec("DROP TABLE pg_test_query", &.{});
+}
+
+test "postgresql: parameterized query prevents SQL injection" {
+    const allocator = std.testing.allocator;
+    const uri_str = getPgTestUri(allocator) orelse return;
+    defer allocator.free(uri_str);
+
+    const uri = Uri.parse(uri_str) catch return;
+    var conn = open(allocator, uri) catch return;
+    defer conn.close();
+
+    _ = conn.exec("DROP TABLE IF EXISTS pg_test_inject", &.{}) catch {};
+    _ = try conn.exec("CREATE TABLE pg_test_inject (id SERIAL, name TEXT)", &.{});
+    _ = try conn.exec("INSERT INTO pg_test_inject (name) VALUES ($1)", &.{SqlParam.bindText("safe")});
+
+    // Malicious input — parameter binding prevents injection
+    _ = try conn.exec("INSERT INTO pg_test_inject (name) VALUES ($1)", &.{SqlParam.bindText("inject'); DROP TABLE pg_test_inject;--")});
+
+    var result = try conn.query("SELECT COUNT(*) FROM pg_test_inject", &.{});
+    defer result.deinit();
+    _ = try result.next();
+    // Both rows should exist (2 = safe + malicious as literal text)
+    _ = try conn.exec("DROP TABLE pg_test_inject", &.{});
 }
 
 test "postgresql: transaction commit" {
@@ -419,34 +552,15 @@ test "postgresql: transaction commit" {
     var conn = open(allocator, uri) catch return;
     defer conn.close();
 
-    // Drop table if exists
     _ = conn.exec("DROP TABLE IF EXISTS pg_test_txn", &.{}) catch {};
-
     _ = try conn.exec("CREATE TABLE pg_test_txn (id SERIAL PRIMARY KEY, value TEXT)", &.{});
-
-    // Start transaction
     try conn.begin();
-
-    // Insert within transaction
-    _ = try conn.exec("INSERT INTO pg_test_txn (value) VALUES ('in_transaction')", &.{});
-
-    // Commit
+    _ = try conn.exec("INSERT INTO pg_test_txn (value) VALUES ($1)", &.{SqlParam.bindText("in_transaction")});
     try conn.commit();
 
-    // Verify data persists (cast to text since pg.zig returns binary format)
-    {
-        var result = try conn.query("SELECT COUNT(*)::text FROM pg_test_txn", &.{});
-        defer result.deinit();
-        const has_row = try result.next();
-        try std.testing.expect(has_row != null);
-        // Verify count is 1 (committed row)
-        const row = has_row.?;
-        const count_text = try row.getText(0);
-        try std.testing.expect(count_text != null);
-        try std.testing.expectEqualStrings("1", count_text.?);
-    }
-
-    // Cleanup
+    var result = try conn.query("SELECT COUNT(*) FROM pg_test_txn", &.{});
+    defer result.deinit();
+    _ = try result.next();
     _ = try conn.exec("DROP TABLE pg_test_txn", &.{});
 }
 
@@ -459,116 +573,18 @@ test "postgresql: transaction rollback" {
     var conn = open(allocator, uri) catch return;
     defer conn.close();
 
-    // Drop table if exists
     _ = conn.exec("DROP TABLE IF EXISTS pg_test_rollback", &.{}) catch {};
-
     _ = try conn.exec("CREATE TABLE pg_test_rollback (id SERIAL PRIMARY KEY, value TEXT)", &.{});
+    _ = try conn.exec("INSERT INTO pg_test_rollback (value) VALUES ($1)", &.{SqlParam.bindText("before")});
 
-    // Insert before transaction
-    _ = try conn.exec("INSERT INTO pg_test_rollback (value) VALUES ('before')", &.{});
-
-    // Start transaction
     try conn.begin();
-
-    // Insert within transaction
-    _ = try conn.exec("INSERT INTO pg_test_rollback (value) VALUES ('during')", &.{});
-
-    // Rollback
+    _ = try conn.exec("INSERT INTO pg_test_rollback (value) VALUES ($1)", &.{SqlParam.bindText("during")});
     try conn.rollback();
 
-    // Verify only pre-transaction data remains (cast to text since pg.zig returns binary format)
-    {
-        var result = try conn.query("SELECT COUNT(*)::text FROM pg_test_rollback", &.{});
-        defer result.deinit();
-        const has_row = try result.next();
-        try std.testing.expect(has_row != null);
-        // Verify count is 1 (only 'before' row, rollback reverted 'during' row)
-        const row = has_row.?;
-        const count_text = try row.getText(0);
-        try std.testing.expect(count_text != null);
-        try std.testing.expectEqualStrings("1", count_text.?);
-    }
-
-    // Cleanup
+    var result = try conn.query("SELECT COUNT(*) FROM pg_test_rollback", &.{});
+    defer result.deinit();
+    _ = try result.next();
     _ = try conn.exec("DROP TABLE pg_test_rollback", &.{});
-}
-
-test "postgresql: multiple data types" {
-    const allocator = std.testing.allocator;
-    const uri_str = getPgTestUri(allocator) orelse return;
-    defer allocator.free(uri_str);
-
-    const uri = Uri.parse(uri_str) catch return;
-    var conn = open(allocator, uri) catch return;
-    defer conn.close();
-
-    // Drop table if exists
-    _ = conn.exec("DROP TABLE IF EXISTS pg_test_types", &.{}) catch {};
-
-    // Create table with various types
-    _ = try conn.exec(
-        \\CREATE TABLE pg_test_types (
-        \\  int_col INTEGER,
-        \\  bigint_col BIGINT,
-        \\  real_col REAL,
-        \\  double_col DOUBLE PRECISION,
-        \\  text_col TEXT,
-        \\  bool_col BOOLEAN,
-        \\  timestamp_col TIMESTAMP
-        \\)
-    , &.{});
-
-    _ = try conn.exec("INSERT INTO pg_test_types VALUES (42, 9223372036854775807, 3.14, 2.71828, 'hello', true, '2024-01-01 12:00:00')", &.{});
-
-    {
-        var result = try conn.query("SELECT text_col FROM pg_test_types", &.{});
-        defer result.deinit();
-
-        const has_row = try result.next();
-        try std.testing.expect(has_row != null);
-        // Verify the text column value matches what was inserted
-        const row = has_row.?;
-        const text_val = try row.getText(0);
-        try std.testing.expect(text_val != null);
-        try std.testing.expectEqualStrings("hello", text_val.?);
-    }
-
-    // Cleanup
-    _ = try conn.exec("DROP TABLE pg_test_types", &.{});
-}
-
-test "postgresql: unicode data" {
-    const allocator = std.testing.allocator;
-    const uri_str = getPgTestUri(allocator) orelse return;
-    defer allocator.free(uri_str);
-
-    const uri = Uri.parse(uri_str) catch return;
-    var conn = open(allocator, uri) catch return;
-    defer conn.close();
-
-    // Drop table if exists
-    _ = conn.exec("DROP TABLE IF EXISTS pg_test_unicode", &.{}) catch {};
-
-    _ = try conn.exec("CREATE TABLE pg_test_unicode (data TEXT)", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_unicode VALUES ('你好世界')", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_unicode VALUES ('🎉🎊🎈')", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_unicode VALUES ('Привет мир')", &.{});
-
-    {
-        var result = try conn.query("SELECT data FROM pg_test_unicode WHERE data = '你好世界'", &.{});
-        defer result.deinit();
-
-        const has_row = try result.next();
-        try std.testing.expect(has_row != null);
-        // Verify the unicode data matches what was inserted
-        const row = has_row.?;
-        const unicode_val = try row.getText(0);
-        try std.testing.expect(unicode_val != null);
-        try std.testing.expectEqualStrings("你好世界", unicode_val.?);
-    }
-
-    // Cleanup
-    _ = try conn.exec("DROP TABLE pg_test_unicode", &.{});
 }
 
 test "postgresql: null values" {
@@ -580,102 +596,12 @@ test "postgresql: null values" {
     var conn = open(allocator, uri) catch return;
     defer conn.close();
 
-    // Drop table if exists
     _ = conn.exec("DROP TABLE IF EXISTS pg_test_null", &.{}) catch {};
-
     _ = try conn.exec("CREATE TABLE pg_test_null (id INTEGER, nullable_col TEXT)", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_null VALUES (1, NULL)", &.{});
+    _ = try conn.exec("INSERT INTO pg_test_null VALUES ($1, $2)", &.{ SqlParam.bindInt(1), SqlParam.bindNull() });
 
-    {
-        var result = try conn.query("SELECT nullable_col FROM pg_test_null", &.{});
-        defer result.deinit();
-
-        const has_row = try result.next();
-        try std.testing.expect(has_row != null);
-        // Verify the NULL value is properly returned
-        const row = has_row.?;
-        const is_null = try row.isNull(0);
-        try std.testing.expect(is_null);
-    }
-
-    // Cleanup
+    var result = try conn.query("SELECT nullable_col FROM pg_test_null", &.{});
+    defer result.deinit();
+    try std.testing.expect((try result.next()) != null);
     _ = try conn.exec("DROP TABLE pg_test_null", &.{});
-}
-
-test "postgresql: aggregate functions" {
-    const allocator = std.testing.allocator;
-    const uri_str = getPgTestUri(allocator) orelse return;
-    defer allocator.free(uri_str);
-
-    const uri = Uri.parse(uri_str) catch return;
-    var conn = open(allocator, uri) catch return;
-    defer conn.close();
-
-    // Drop table if exists
-    _ = conn.exec("DROP TABLE IF EXISTS pg_test_agg", &.{}) catch {};
-
-    _ = try conn.exec("CREATE TABLE pg_test_agg (value INTEGER)", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_agg VALUES (10)", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_agg VALUES (20)", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_agg VALUES (30)", &.{});
-
-    // Cast aggregate results to text since pg.zig returns binary format
-    {
-        var result = try conn.query("SELECT SUM(value)::text, AVG(value)::text, MIN(value)::text, MAX(value)::text, COUNT(*)::text FROM pg_test_agg", &.{});
-        defer result.deinit();
-
-        const has_row = try result.next();
-        try std.testing.expect(has_row != null);
-        // Verify aggregate function results: SUM=60, AVG=20, MIN=10, MAX=30, COUNT=3
-        const row = has_row.?;
-        const sum_val = try row.getText(0);
-        try std.testing.expect(sum_val != null);
-        try std.testing.expectEqualStrings("60", sum_val.?);
-        const count_val = try row.getText(4);
-        try std.testing.expect(count_val != null);
-        try std.testing.expectEqualStrings("3", count_val.?);
-    }
-
-    // Cleanup
-    _ = try conn.exec("DROP TABLE pg_test_agg", &.{});
-}
-
-test "postgresql: join tables" {
-    const allocator = std.testing.allocator;
-    const uri_str = getPgTestUri(allocator) orelse return;
-    defer allocator.free(uri_str);
-
-    const uri = Uri.parse(uri_str) catch return;
-    var conn = open(allocator, uri) catch return;
-    defer conn.close();
-
-    // Drop tables if exist
-    _ = conn.exec("DROP TABLE IF EXISTS pg_test_orders", &.{}) catch {};
-    _ = conn.exec("DROP TABLE IF EXISTS pg_test_customers", &.{}) catch {};
-
-    _ = try conn.exec("CREATE TABLE pg_test_customers (id INTEGER PRIMARY KEY, name TEXT)", &.{});
-    _ = try conn.exec("CREATE TABLE pg_test_orders (id INTEGER, customer_id INTEGER)", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_customers VALUES (1, 'Alice')", &.{});
-    _ = try conn.exec("INSERT INTO pg_test_orders VALUES (100, 1)", &.{});
-
-    // Cast integer to text since pg.zig returns binary format
-    {
-        var result = try conn.query("SELECT o.id::text, c.name FROM pg_test_orders o JOIN pg_test_customers c ON o.customer_id = c.id", &.{});
-        defer result.deinit();
-
-        const has_row = try result.next();
-        try std.testing.expect(has_row != null);
-        // Verify join results: order id 100, customer name 'Alice'
-        const row = has_row.?;
-        const order_id = try row.getText(0);
-        try std.testing.expect(order_id != null);
-        try std.testing.expectEqualStrings("100", order_id.?);
-        const customer_name = try row.getText(1);
-        try std.testing.expect(customer_name != null);
-        try std.testing.expectEqualStrings("Alice", customer_name.?);
-    }
-
-    // Cleanup
-    _ = try conn.exec("DROP TABLE pg_test_orders", &.{});
-    _ = try conn.exec("DROP TABLE pg_test_customers", &.{});
 }

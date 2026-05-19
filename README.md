@@ -5,22 +5,28 @@ A high-performance, type-safe database abstraction layer for Zig using the VTabl
 ## Features
 
 - **VTable Pattern**: Zero-cost abstraction using Zig's compile-time features
-- **Multiple Backends**: Support for SQLite, PostgreSQL, and MySQL
+- **Multiple Backends**: SQLite, PostgreSQL, MySQL, Mock
+- **Real Parameter Binding**: SQLite (`bindValue`), PostgreSQL (`PQexecParams`), MySQL (`mysql_stmt_bind_param`) — no string interpolation
 - **Unified Interface**: Consistent API across all database backends
 - **Connection Pooling**: Built-in thread-safe connection pool
 - **URI-based Connections**: Easy connection string parsing
 - **Type Safety**: Compile-time type checking for database operations
 
-> **Note**: Parameter binding support is currently limited. The `params` argument is reserved for future implementation of parameterized queries. For now, use proper escaping or prepared statements at the application level to prevent SQL injection.
-
 ## Supported Databases
 
-| Database   | Library                                                    | Status       |
-|------------|-----------------------------------------------------------|--------------|
-| SQLite     | [zqlite.zig](https://github.com/karlseguin/zqlite.zig)   | ✅ Available |
-| PostgreSQL | [pg.zig](https://github.com/karlseguin/pg.zig)           | ✅ Available |
-| MySQL      | [myzql](https://github.com/speed2exe/myzql)              | ✅ Available |
-| Mock       | Built-in                                                  | ✅ Available |
+| Database   | Driver                       | Parameter Binding            | Build Flag        |
+|------------|------------------------------|------------------------------|-------------------|
+| SQLite     | [zqlite.zig](https://github.com/karlseguin/zqlite.zig) | ✅ `bindValue` (real prepared statement) | Always enabled |
+| PostgreSQL | libpq (C library, system)    | ✅ `PQexecParams` (binary protocol) | `-Duse_pg=true`   |
+| MySQL      | libmysqlclient (C library, system) | ✅ `mysql_stmt_bind_param` (binary protocol) | `-Duse_mysql=true` |
+| Mock       | Built-in                     | N/A (testing only)           | Always enabled |
+
+## Requirements
+
+- **Zig** 0.16.0 or later
+- **SQLite**: `libsqlite3` (system library) — always required for build
+- **PostgreSQL**: `libpq` (Homebrew: `brew install libpq`, apt: `libpq-dev`) — opt-in
+- **MySQL**: `libmysqlclient` (Homebrew: `brew install mysql`, apt: `libmysqlclient-dev`) — opt-in
 
 ## Installation
 
@@ -29,8 +35,8 @@ Add ZDBC to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .zdbc = .{
-        .url = "https://github.com/zhaozg/zdbc/archive/refs/heads/main.tar.gz",
-        // Add hash after first build
+        .url = "https://github.com/chy3xyz/zigdbc/archive/refs/heads/main.tar.gz",
+        .hash = "zdbc-0.3.0-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     },
 },
 ```
@@ -63,10 +69,10 @@ pub fn main() !void {
     // Execute DDL
     _ = try conn.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
 
-    // Insert with parameters
+    // Insert with parameters — real prepared statement binding
     _ = try conn.exec(
         "INSERT INTO users (name) VALUES (?)",
-        &.{zdbc.Value.initText("John")},
+        &.{zdbc.SqlParam.bindText("John")},
     );
 
     // Query rows
@@ -83,18 +89,16 @@ pub fn main() !void {
 
 ## URI Formats
 
-ZDBC supports URI-based connection strings:
-
 ```
 # SQLite
 sqlite:///path/to/database.db
 sqlite://:memory:
 
-# PostgreSQL
+# PostgreSQL (requires -Duse_pg=true)
 postgresql://user:password@host:port/database
-postgres://user:password@host:port/database?options
+postgres://user:password@host:port/database
 
-# MySQL
+# MySQL (requires -Duse_mysql=true)
 mysql://user:password@host:port/database
 mariadb://user:password@host:port/database
 ```
@@ -109,40 +113,54 @@ var conn = try zdbc.open(allocator, "sqlite:///test.db");
 defer conn.close();
 
 // Execute queries (INSERT, UPDATE, DELETE)
+// Uses real parameter binding — parameters and SQL are sent separately
 const affected = try conn.exec("INSERT INTO users (name) VALUES (?)", &.{
-    zdbc.Value.initText("John"),
+    zdbc.SqlParam.bindText("John"),
 });
 
 // Query rows (SELECT)
-var result = try conn.query("SELECT * FROM users", &.{});
-defer result.deinit();
-
-// Single row query
-const row = try conn.row("SELECT * FROM users WHERE id = ?", &.{
-    zdbc.Value.initInt(1),
+var result = try conn.query("SELECT * FROM users WHERE age > ?", &.{
+    zdbc.SqlParam.bindInt(18),
 });
+defer result.deinit();
 
 // Transactions
 try conn.begin();
 errdefer conn.rollback() catch {};
 // ... operations ...
 try conn.commit();
+
+// Ping health check
+try conn.ping();
+
+// Get last insert row ID
+const id = conn.lastInsertId();
+
+// Get affected rows count
+const rows = conn.affectedRows();
 ```
 
-### Value Types
+### Parameter Types (SqlParam)
+
+All drivers use `SqlParam` for safe, binary parameter binding:
 
 ```zig
-// Create values for parameter binding
-const null_val = zdbc.Value.initNull();
-const bool_val = zdbc.Value.initBool(true);
-const int_val = zdbc.Value.initInt(42);
-const float_val = zdbc.Value.initFloat(3.14);
-const text_val = zdbc.Value.initText("hello");
-const blob_val = zdbc.Value.initBlob(&[_]u8{0x01, 0x02, 0x03});
-
-// Or use the convenience function
-const val = zdbc.fromAny("hello"); // Automatically detects type
+const null_val = zdbc.SqlParam.bindNull();
+const int_val = zdbc.SqlParam.bindInt(42);
+const real_val = zdbc.SqlParam.bindReal(3.14);
+const text_val = zdbc.SqlParam.bindText("hello");
+const blob_val = zdbc.SqlParam.bindBlob(&[_]u8{0x01, 0x02});
 ```
+
+> **SQL injection prevention**: Parameters are sent via native binary protocols — SQL template and values are never concatenated. This is safe against all forms of SQL injection.
+
+### Placeholder Syntax
+
+| Driver | Placeholder | Example |
+|--------|------------|---------|
+| SQLite | `?` | `... WHERE id = ?` |
+| PostgreSQL | `$1, $2, $N` | `... WHERE id = $1 AND name = $2` |
+| MySQL | `?` | `... WHERE id = ?` |
 
 ### Result Iteration
 
@@ -152,7 +170,7 @@ defer result.deinit();
 
 // Get column info
 const col_count = result.columnCount();
-const col_name = result.columnName(0); // "id"
+const col_name = result.columnName(0);
 
 // Iterate rows
 while (try result.next()) |row| {
@@ -182,7 +200,7 @@ _ = try conn.exec("SELECT 1", &.{});
 
 ## Architecture
 
-ZDBC uses the VTable pattern for polymorphism:
+ZDBC uses the VTable pattern for zero-cost polymorphism:
 
 ```
 ┌─────────────────┐
@@ -196,7 +214,7 @@ ZDBC uses the VTable pattern for polymorphism:
          ▼
 ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
 │  SQLite Driver  │ │   PG Driver     │ │  MySQL Driver   │
-│  (zqlite.zig)   │ │   (pg.zig)      │ │   (myzql)       │
+│  (zqlite.zig)   │ │  (libpq)        │ │ (libmysqlclient)│
 └─────────────────┘ └─────────────────┘ └─────────────────┘
 ```
 
@@ -208,58 +226,56 @@ This pattern provides:
 ## Building
 
 ```bash
-# Build the library
+# Basic build (SQLite only)
 zig build
+
+# With PostgreSQL support (requires libpq)
+zig build -Duse_pg=true
+
+# With MySQL support (requires libmysqlclient)
+zig build -Duse_mysql=true
+
+# With both
+zig build -Duse_pg=true -Duse_mysql=true
 
 # Run tests
 zig build test
-
-# Run the basic example
-zig build run
-
-# Run the high-performance log example (1M records)
-zig build run-log
+zig build test -Duse_pg=true -Duse_mysql=true
 
 # Format code
 zig fmt src
 ```
 
-## Examples
+### Homebrew Users (macOS)
 
-See the [`examples/`](examples/) directory for detailed examples:
+The build system auto-detects Homebrew paths for:
+- PostgreSQL: `/opt/homebrew/opt/libpq/{include,lib}`
+- MySQL: `/opt/homebrew/opt/mysql/{include,lib}`
 
-- **[log.zig](examples/log.zig)** - High-performance bulk insert demonstration
-  - Inserts 1 million log records using optimized batching
-  - Demonstrates transaction batching, multi-value INSERTs, and SQLite tuning
-  - Achieves ~4,000+ records/second throughput
-
-```bash
-# Run the log example
-zig build run-log
-```
-
-## Requirements
-
-- Zig 0.16.0
-- For SQLite: `libsqlite3-dev` (system library)
-- For PostgreSQL: Network access to PostgreSQL server
-- For MySQL: Network access to MySQL/MariaDB server (NOTE: MySQL driver is stubbed for Zig 0.16.0 due to API changes in myzql library)
-
-## Zig 0.16.0 Compatibility
-
-ZDBC has been upgraded to support Zig 0.16.0. However, there are some notes:
-
-- **SQLite**: Fully functional with zqlite.zig
-- **PostgreSQL**: Uses pg.zig with Io.failing placeholder (actual connections require proper Io context setup)
-- **MySQL**: MySQL driver is stubbed due to significant API changes in myzql library which now requires Zig's new async I/O model (Io context). All MySQL operations return `Error.NotImplemented`.
-- **Examples**: Examples are disabled for Zig 0.16.0 due to breaking API changes in the standard library (GeneralPurposeAllocator, argsAlloc, fs.cwd, etc.)
+For other install locations, set `addIncludePath` and `addLibraryPath` in your `build.zig`.
 
 ## Testing
 
 Run the test suite:
 
 ```bash
+# All enabled backends
+zig build test -Duse_pg=true -Duse_mysql=true
+
+# SQLite + Mock only (no external services)
 zig build test
+```
+
+Integration tests require running database servers and environment variables:
+
+**PostgreSQL:**
+```bash
+ZDBC_PG_HOST=localhost ZDBC_PG_USER=postgres ZDBC_PG_PASSWORD=secret zig build test -Duse_pg=true
+```
+
+**MySQL:**
+```bash
+ZDBC_MY_HOST=localhost ZDBC_MY_USER=root ZDBC_MY_PASSWORD=secret zig build test -Duse_mysql=true
 ```
 
 For testing without a real database, use the mock driver:
@@ -279,10 +295,10 @@ defer conn.close();
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License — see LICENSE file for details.
 
 ## Acknowledgments
 
-- [zqlite.zig](https://github.com/karlseguin/zqlite.zig) - SQLite wrapper
-- [pg.zig](https://github.com/karlseguin/pg.zig) - PostgreSQL driver
-- [myzql](https://github.com/speed2exe/myzql) - MySQL/MariaDB driver
+- [zqlite.zig](https://github.com/karlseguin/zqlite.zig) — SQLite wrapper for Zig
+- [libpq](https://www.postgresql.org/docs/current/libpq.html) — PostgreSQL C client library
+- [libmysqlclient](https://dev.mysql.com/doc/c-api/9.0/en/) — MySQL C client library
